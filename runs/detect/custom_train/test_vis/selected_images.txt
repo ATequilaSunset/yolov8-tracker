@@ -1,0 +1,10 @@
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000009.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000025.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000030.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000034.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000036.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000042.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000049.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000061.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000064.jpg
+/data/lz/pythonProjects/HP-tracker/yolov8/coco128/images/train2017/000000000071.jpg
