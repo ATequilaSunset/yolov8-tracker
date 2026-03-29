@@ -37,13 +37,13 @@ def de_parallel(model):
 # ─────────────────────────── 超参数配置 ───────────────────────────
 CFG = {
     # 数据集
-    "data_yaml":     "/data/lz/pythonProjects/HP-tracker/yolov8/coco128.yaml",
-    "imgsz":         640,
-    "batch":         16,
+    "data_yaml":     "/data/lz/pythonProjects/HP-tracker/yolov8/satvideodt.yaml",
+    "imgsz":         1024,
+    "batch":         32,
     "workers":       4,
     # 模型
     "model_weights": "yolov8n.pt",
-    "nc":            80,
+    "nc":            1,
     # 训练
     "epochs":        50,
     "lr0":           1e-3,      # 初始学习率
@@ -51,7 +51,7 @@ CFG = {
     "weight_decay":  5e-4,
     "warmup_epochs": 3,
     # 保存 & 日志
-    "save_dir":      "/data/lz/pythonProjects/HP-tracker/yolov8/runs/detect/custom_train",
+    "save_dir":      "/data/lz/pythonProjects/HP-tracker/yolov8/sat_results",
     "save_period":   5,         # 每 N epoch 保存一次 checkpoint
     # 断点续训：填写 checkpoint 路径可续训，留空则从头训练
     "resume":        "",
@@ -187,7 +187,61 @@ def train(rank=-1, world_size=1):
 
     # ── 构建模型 ──────────────────────────────────────────────────
     yolo   = YOLO(cfg["model_weights"])
-    model  = yolo.model.to(device)
+    model  = yolo.model
+
+    # ── 策略A：替换 Detect head，使 nc 与自定义数据集匹配 ────────────
+    # 预训练权重的 Detect head 输出 80 类，SatVideoDT 只有 1 类，
+    # 直接重建 head 的分类分支，backbone/neck 权重保持不变。
+    detect_head = model.model[-1]          # ultralytics Detect 层
+    if detect_head.nc != cfg["nc"]:
+        nc_new = cfg["nc"]
+        old_nc = detect_head.nc
+        detect_head.nc = nc_new
+        # cv3 是分类卷积组（每个尺度一组），重新初始化最后一层卷积
+        for i, cv3_seq in enumerate(detect_head.cv3):
+            # cv3_seq 是 Sequential，最后一个元素可能是：
+            #   - ultralytics Conv（有 .conv 属性）
+            #   - 原生 nn.Conv2d（无 .conv 属性）
+            last = cv3_seq[-1]
+            if hasattr(last, 'conv') and isinstance(last.conv, torch.nn.Conv2d):
+                # ultralytics Conv 包装类
+                raw_conv = last.conv
+                in_ch = raw_conv.in_channels
+                last.conv = torch.nn.Conv2d(
+                    in_ch, nc_new,
+                    kernel_size=raw_conv.kernel_size,
+                    stride=raw_conv.stride,
+                    padding=raw_conv.padding,
+                    bias=raw_conv.bias is not None,
+                )
+                torch.nn.init.normal_(last.conv.weight, std=0.01)
+                if last.conv.bias is not None:
+                    torch.nn.init.zeros_(last.conv.bias)
+                if hasattr(last, 'bn'):
+                    last.bn = torch.nn.BatchNorm2d(nc_new)
+            elif isinstance(last, torch.nn.Conv2d):
+                # 原生 nn.Conv2d，直接替换整个元素
+                in_ch = last.in_channels
+                new_conv2d = torch.nn.Conv2d(
+                    in_ch, nc_new,
+                    kernel_size=last.kernel_size,
+                    stride=last.stride,
+                    padding=last.padding,
+                    bias=last.bias is not None,
+                )
+                torch.nn.init.normal_(new_conv2d.weight, std=0.01)
+                if new_conv2d.bias is not None:
+                    torch.nn.init.zeros_(new_conv2d.bias)
+                cv3_seq[-1] = new_conv2d
+            else:
+                raise TypeError(f"cv3[{i}][-1] 类型未知: {type(last)}，无法替换分类头")
+        LOGGER.info(f"Detect head nc: {old_nc} -> {nc_new}，分类分支已重新初始化")
+
+    model = model.to(device)
+
+
+
+
     # 关键修复：确保参数可训练（某些权重可能默认全冻结）
     for p in model.parameters():
         p.requires_grad_(True)    
@@ -241,7 +295,10 @@ def train(rank=-1, world_size=1):
 
     # ── DDP 包装 ───────────────────────────────────────────────────
     if ddp:
-        model = DDP(model, device_ids=[rank], output_device=rank)
+        # find_unused_parameters=True：YOLOv8 Detect head 中存在不参与 loss
+        # 计算的参数（如 stride buffer），DDP reducer 检测不到其梯度会报错，
+        # 开启此选项后 DDP 会在每次 forward 后检查哪些参数未使用，跳过它们。
+        model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
     # ── 损失函数（ultralytics 内置 v8DetectionLoss） ────────────────
     compute_loss = TupleCompatibleDetectionLoss(model, de_parallel)
@@ -282,12 +339,12 @@ def train(rank=-1, world_size=1):
             # loss 是形状 [3] 的向量(box/cls/dfl)，sum() 得标量
             loss_scalar = loss.sum()
 
-            print("model.training =", model.training)
-            print("loss.requires_grad =", loss.requires_grad, "loss.grad_fn =", loss.grad_fn)
-            print("loss_scalar.requires_grad =", loss_scalar.requires_grad, "loss_scalar.grad_fn =", loss_scalar.grad_fn)
+            # print("model.training =", model.training)
+            # print("loss.requires_grad =", loss.requires_grad, "loss.grad_fn =", loss.grad_fn)
+            # print("loss_scalar.requires_grad =", loss_scalar.requires_grad, "loss_scalar.grad_fn =", loss_scalar.grad_fn)
 
             n_trainable = sum(p.requires_grad for p in model.parameters())
-            print("trainable params:", n_trainable)
+            # print("trainable params:", n_trainable)
 
             # ── 反向传播（AMP Scaler）──────────────────────────────
             scaler.scale(loss_scalar).backward()

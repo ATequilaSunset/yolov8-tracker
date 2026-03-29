@@ -1,0 +1,9 @@
+# SatVideoDT dataset - satellite video car detection
+path: /data/lz/SatVideoDT/yolo_dataset
+train: images/train
+val:   images/val
+
+nc: 1
+
+names:
+  0: car
