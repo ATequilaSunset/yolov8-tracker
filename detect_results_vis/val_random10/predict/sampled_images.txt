@@ -1,0 +1,10 @@
+/data/lz/SatVideoDT/yolo_dataset/images/val/011_000300.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/011_000387.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/004_000232.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/006_000275.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/005_000270.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/011_000239.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/011_000043.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/003_000261.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/009_000150.jpg
+/data/lz/SatVideoDT/yolo_dataset/images/val/005_000206.jpg

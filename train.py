@@ -35,8 +35,8 @@ def patch_parse_model():
     Monkey-patch ultralytics.nn.tasks.parse_model，在 else 分支前
     插入对 BackgroundReconstruct 和 FeatureEnhance 的通道处理逻辑：
 
-      BackgroundReconstruct(c1)         -> 输出 1ch  (diff_map)
-      FeatureEnhance(c1, c_diff=1)      -> 输出 c1 ch (与 feat_early 相同)
+      BackgroundReconstruct(c1)                     -> 输出 1ch  (diff_map)
+      FeatureEnhance(c1, groups=4, reduction_ratio=2) -> 输出 c1 ch (与 feat_early 相同)
 
     parse_model 的 else 分支默认 c2 = ch[f]，对多输入层取最后一个 from
     的通道数。这对我们两个模块均不正确，需要显式覆盖。
@@ -100,19 +100,24 @@ def patch_parse_model():
         # value: callable(args, ch_in_list) -> (c2, new_args)
         #   c2        : 该模块的输出通道数（用于更新 ch 列表）
         #   new_args  : 传给模块 __init__ 的最终 args
+        # train.py -> patch_parse_model() 内部
         def _bgr_channels(args, ch_in_list):
-            # BackgroundReconstruct(c1, [c_mid])
-            # 输入通道 c1 = ch[from]，从 ch_in_list 取
             c1 = ch_in_list[0]
-            new_args = [c1] + list(args[1:])  # args[0] 已是 c1，直接用
-            return 1, new_args  # 输出 1ch diff_map
+            c_mid = args[0] if len(args) > 0 else None
+            c_out = args[1] if len(args) > 1 else 3  # 默认 3 通道（与你的权重一致）
+            new_args = [c1, c_mid, c_out]
+            return c_out, new_args  # ✅ 必须返回 c_out，不能写死 1
 
         def _feh_channels(args, ch_in_list):
-            # FeatureEnhance(c1, c_diff=1)
-            # c1 = ch[from[0]] (feat_early)，c_diff = ch[from[1]] (diff_map)
-            c1   = ch_in_list[0]  # feat_early 通道数
-            c_diff = ch_in_list[1] if len(ch_in_list) > 1 else 1
-            new_args = [c1, c_diff]
+            # FeatureEnhance(c1, groups=4, reduction_ratio=2)
+            # c1 = ch[from[0]] (feat_early)，diff_map 仍由 from[1] 传入 forward
+            c1 = ch_in_list[0]
+
+            # 兼容 yaml 可选参数：args = [c1, groups, reduction_ratio]
+            # 若未提供则使用模块默认值
+            groups = args[1] if len(args) > 1 else 4
+            reduction_ratio = args[2] if len(args) > 2 else 2
+            new_args = [c1, groups, reduction_ratio]
             return c1, new_args   # 输出与 feat_early 通道数相同
 
         custom_channel_handlers = {
@@ -249,9 +254,10 @@ CFG = {
     # 数据集
     "data_yaml":     "/data/lz/pythonProjects/HP-tracker/yolov8/satvideodt.yaml",
     "imgsz":         1024,
-    "batch":         32,
+    "batch":         16,
     "workers":       4,
     # 模型
+    "recon_weights": "/data/lz/pythonProjects/HP-tracker/yolov8/recon_checkpoints/recon_epoch_0038.pth", 
     "model_yaml":    "/data/lz/pythonProjects/HP-tracker/yolov8/yolov8n_custom.yaml",
     "model_weights": "/data/lz/pythonProjects/HP-tracker/yolov8/yolov8n.pt",
     "nc":            1,
@@ -262,7 +268,7 @@ CFG = {
     "weight_decay":  5e-4,
     "warmup_epochs": 3,
     # 保存 & 日志
-    "save_dir":      "/data/lz/pythonProjects/HP-tracker/yolov8/sat_results",
+    "save_dir":      "/data/lz/pythonProjects/HP-tracker/yolov8/yolo-enhance-results",
     "save_period":   5,
     # 断点续训：填写 checkpoint 路径可续训，留空则从头训练
     "resume":        "",
@@ -454,12 +460,46 @@ def load_pretrained_weights(model, weights_path, device):
     return model
 
 
+def load_recon_pretrained(model, recon_ckpt_path, device):
+    """将独立的 BackgroundReconstruct 权重精准注入 YOLO 的 layer 2"""
+    if not recon_ckpt_path or not os.path.exists(recon_ckpt_path):
+        LOGGER.info("⚠️  未指定或找不到重建模块权重，跳过加载")
+        return model
+
+    ckpt = torch.load(recon_ckpt_path, map_location=device)
+    # 兼容 torch.save(state_dict) 或 torch.save({'model': state_dict})
+    recon_sd = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+
+    # 1. 清理 DataParallel 遗留的 module. 前缀
+    cleaned_sd = {k.replace("module.", ""): v for k, v in recon_sd.items()}
+
+    # 2. 拼接 YOLO 模型中的正确前缀 (单卡: model.2. | DDP: module.model.2.)
+    is_ddp = isinstance(model, DDP)
+    prefix = "module.model.2." if is_ddp else "model.2."
+    mapped_sd = {prefix + k: v for k, v in cleaned_sd.items()}
+
+    # 3. 通道形状预检（防止 1ch/3ch 不一致导致崩溃）
+    current_sd = model.state_dict()
+    shape_mismatch = []
+    for k, v in mapped_sd.items():
+        if k in current_sd and current_sd[k].shape != v.shape:
+            shape_mismatch.append(f"  {k} -> 模型{current_sd[k].shape} vs 权重{v.shape}")
+    if shape_mismatch:
+        LOGGER.error("❌ 权重通道形状不匹配，已中止加载：\n" + "\n".join(shape_mismatch))
+        LOGGER.error("请确保 YAML 中 BackgroundReconstruct 的 c_out 与预训练权重一致！")
+        return model
+
+    # 4. 注入权重
+    model.load_state_dict(mapped_sd, strict=False)
+    LOGGER.info(f"✅ 成功加载 BackgroundReconstruct 权重至 layer 2: {recon_ckpt_path}")
+    return model
+
 # ─────────────────────────── 主训练函数 ───────────────────────────
 def train(rank=-1, world_size=1):
     cfg    = CFG
     ddp    = rank != -1
     main   = is_main(rank)
-    device = torch.device(f"cuda:{rank}" if ddp else ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    device = torch.device(f"cuda:{rank}" if ddp else ("cuda:3" if torch.cuda.is_available() else "cpu"))
 
     save_dir = Path(cfg["save_dir"])
     writer   = None
@@ -474,6 +514,13 @@ def train(rank=-1, world_size=1):
 
     # ── 迁移预训练权重（backbone/neck 层按结构顺序对齐迁移）────────────
     model = load_pretrained_weights(model, cfg["model_weights"], device="cpu")
+
+    # ✅ 新增：加载 BackgroundReconstruct 独立预训练权重
+    model = load_recon_pretrained(model, cfg.get("recon_weights"), device=device)
+
+    if main:
+        recon_layer = de_parallel(model).model[2]
+        LOGGER.info(f"[验证] BackgroundReconstruct 输出通道: {recon_layer.c_out}")
 
     model = model.to(device)
 
@@ -536,8 +583,10 @@ def train(rank=-1, world_size=1):
 
     # ── DataLoader ────────────────────────────────────────────────────
     train_loader, train_sampler = get_dataloader(cfg, rank, mode="train")
+    val_loader, val_sampler     = get_dataloader(cfg, rank, mode="val")
     if main:
         LOGGER.info(f"训练集批次数: {len(train_loader)}")
+        LOGGER.info(f"验证集批次数: {len(val_loader)}")
         LOGGER.info(f"可训练参数张量数量: {len(trainable_params)}")
 
     # ─────────────────────────── 训练主循环 ───────────────────────────
@@ -545,6 +594,8 @@ def train(rank=-1, world_size=1):
         model.train()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
 
         epoch_loss  = 0.0
         box_loss_ep = 0.0
@@ -592,14 +643,46 @@ def train(rank=-1, world_size=1):
         avg_box   = box_loss_ep / n_batches
         avg_cls   = cls_loss_ep / n_batches
         avg_dfl   = dfl_loss_ep / n_batches
+
+        # ── 验证集 loss（仅前向，不更新参数）─────────────────────────────
+        model.eval()
+        val_loss_ep = 0.0
+        val_box_ep  = 0.0
+        val_cls_ep  = 0.0
+        val_dfl_ep  = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch["img"]       = batch["img"].to(device, non_blocking=True).float() / 255.0
+                batch["bboxes"]    = batch["bboxes"].to(device)
+                batch["cls"]       = batch["cls"].to(device)
+                batch["batch_idx"] = batch["batch_idx"].to(device)
+
+                with autocast(device_type=device.type):
+                    preds = model(batch["img"])
+
+                v_loss, v_items = compute_loss(preds, batch)
+                v_scalar = v_loss.sum()
+                val_loss_ep += v_scalar.item()
+                val_box_ep  += v_items[0].item()
+                val_cls_ep  += v_items[1].item()
+                val_dfl_ep  += v_items[2].item()
+
+        n_val_batches = len(val_loader)
+        avg_val_loss  = val_loss_ep / n_val_batches
+        avg_val_box   = val_box_ep  / n_val_batches
+        avg_val_cls   = val_cls_ep  / n_val_batches
+        avg_val_dfl   = val_dfl_ep  / n_val_batches
+
         elapsed   = time.time() - t0
         lr_cur    = optimizer.param_groups[0]["lr"]
 
         if main:
             LOGGER.info(
                 f"\n=== Epoch {epoch+1}/{cfg['epochs']}  "
-                f"loss={avg_loss:.4f}  box={avg_box:.4f}  "
-                f"cls={avg_cls:.4f}  dfl={avg_dfl:.4f}  "
+                f"train_loss={avg_loss:.4f}  train_box={avg_box:.4f}  "
+                f"train_cls={avg_cls:.4f}  train_dfl={avg_dfl:.4f}  "
+                f"val_loss={avg_val_loss:.4f}  val_box={avg_val_box:.4f}  "
+                f"val_cls={avg_val_cls:.4f}  val_dfl={avg_val_dfl:.4f}  "
                 f"lr={lr_cur:.6f}  time={elapsed:.1f}s ==="
             )
             global_step = epoch + 1
@@ -607,11 +690,15 @@ def train(rank=-1, world_size=1):
             writer.add_scalar("Loss/box",   avg_box,  global_step)
             writer.add_scalar("Loss/cls",   avg_cls,  global_step)
             writer.add_scalar("Loss/dfl",   avg_dfl,  global_step)
+            writer.add_scalar("Loss/val",   avg_val_loss, global_step)
+            writer.add_scalar("Val/box",    avg_val_box,  global_step)
+            writer.add_scalar("Val/cls",    avg_val_cls,  global_step)
+            writer.add_scalar("Val/dfl",    avg_val_dfl,  global_step)
             writer.add_scalar("LR/lr0",     lr_cur,   global_step)
 
-            is_best = avg_loss < best_loss
+            is_best = avg_val_loss < best_loss
             if is_best:
-                best_loss = avg_loss
+                best_loss = avg_val_loss
 
             ckpt = {
                 "epoch":     epoch,
@@ -646,6 +733,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ddp", action="store_true", help="启用 DDP 多卡训练")
     args = parser.parse_args()
+
 
     if args.ddp:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))

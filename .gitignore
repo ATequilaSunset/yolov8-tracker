@@ -4,3 +4,4 @@ datasets/
 sat_results/
 runs/
 coco128/
+recon_checkpoints/

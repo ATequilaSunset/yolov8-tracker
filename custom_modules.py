@@ -19,6 +19,8 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple
 
 
 # ─────────────────────────────────────────────────────────────
@@ -39,116 +41,168 @@ class CBS(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────
-# 模块1：BackgroundReconstruct
+# 模块1：BackgroundReconstruct (替换为 reconstruction.py 逻辑)
 # ─────────────────────────────────────────────────────────────
+class UpSampleBlock(nn.Module):
+    """对应 reconstruction.py 公式 (1): UpSample(X) = ReLU(Conv1(ReLU(Conv1(TransConv(X)))))"""
+    def __init__(self, in_channels):
+        super().__init__()
+        self.trans_conv = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=4, stride=2, padding=1)
+        self.conv1_1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.conv1_2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.trans_conv(x)
+        x = self.relu(self.conv1_1(x))
+        x = self.relu(self.conv1_2(x))
+        return x
+
+class ReconstructionModule(nn.Module):
+    """对应 reconstruction.py 中的重建模块 (RM) 和公式 (2)"""
+    def __init__(self, feature_channels, output_channels=3):
+        super().__init__()
+        self.up1 = UpSampleBlock(feature_channels)
+        self.up2 = UpSampleBlock(feature_channels)
+        self.final_conv = nn.Conv2d(feature_channels, output_channels, kernel_size=3, padding=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x_p2):
+        x = self.up1(x_p2)
+        x = self.up2(x)
+        x = self.final_conv(x)
+        return self.sigmoid(x)
+
 class BackgroundReconstruct(nn.Module):
     """
-    背景重建模块。
-
-    轻量 encoder-decoder 从特征图中预测背景强度，
-    与特征图通道均值作差，输出前景显著性图 diff_map (1ch)。
-
-    Args:
-        c1 (int): 输入通道数（feat_early 的通道数，通常为 128）
-        c_mid (int): 中间隐层通道数，默认 c1 // 4
+    基于 reconstruction.py 的自重建差异图生成模块。
+    输入 : feat_early  (B, C, H, W)  —— 原图经过两次 CBS 下采样后的特征图
+    输出 : diff_map    (B, c_out, H, W) —— 重建图与原始特征的绝对差异图
     """
-
-    def __init__(self, c1: int, c_mid: int = None):
+    def __init__(self, c1: int, c_mid: int = None, c_out: int = 1):
         super().__init__()
-        c_mid = c_mid or max(c1 // 4, 16)
-
-        # 轻量 encoder：降低通道维度，捕获全局背景统计
-        self.encoder = nn.Sequential(
-            CBS(c1,    c_mid, k=3, s=1),   # 保持空间分辨率
-            CBS(c_mid, c_mid, k=3, s=1),
-        )
-
-        # 全局上下文：用 GAP + FC 捕获全局背景均值（类 SE）
-        self.global_ctx = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),                  # (B, c_mid, 1, 1)
-            nn.Flatten(),                              # (B, c_mid)
-            nn.Linear(c_mid, c_mid, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(c_mid, c_mid, bias=False),
-            nn.Sigmoid(),
-        )
-
-        # decoder：还原到 1 通道背景预测图
-        self.decoder = nn.Sequential(
-            CBS(c_mid, c_mid // 2, k=3, s=1),
-            nn.Conv2d(c_mid // 2, 1, kernel_size=1, bias=True),  # 输出 1ch bg_pred
-        )
+        self.c_out = c_out
+        # 使用 reconstruction.py 的重建结构，输入通道为 c1，输出通道由 c_out 控制
+        self.recon_module = ReconstructionModule(feature_channels=c1, output_channels=c_out)
 
     def forward(self, feat_early: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            feat_early: (B, C, H, W)  两次 CBS 下采样后的特征图
-        Returns:
-            diff_map:   (B, 1, H, W)  前景显著性差分图
-        """
-        # encoder
-        x = self.encoder(feat_early)                              # (B, c_mid, H, W)
-
-        # 全局背景上下文调制
-        ctx = self.global_ctx(x)                                  # (B, c_mid)
-        x = x * ctx.view(ctx.shape[0], ctx.shape[1], 1, 1)       # channel-wise modulation
-
-        # decoder：预测背景图
-        bg_pred = self.decoder(x)                                 # (B, 1, H, W)
-
-        # 前景差分：特征图通道均值 - 背景预测
-        # feat_mean 代表该空间位置的"综合特征强度"
-        feat_mean = feat_early.mean(dim=1, keepdim=True)          # (B, 1, H, W)
-        diff_map  = feat_mean - bg_pred                           # (B, 1, H, W)
-
+        H_in, W_in = feat_early.shape[2:]
+        
+        # 1. 执行重建 (因 2 次 stride=2 的 TransConv，尺寸会变为 4H x 4W)
+        recon_out = self.recon_module(feat_early)
+        
+        # 2. 空间尺寸对齐回 feat_early 的 (H, W)
+        if recon_out.shape[2:] != (H_in, W_in):
+            recon_out = F.interpolate(recon_out, size=(H_in, W_in), mode='bilinear', align_corners=False)
+            
+        # 3. 通道对齐：若 feat_early 通道数 != c_out，取均值并扩展
+        feat_aligned = feat_early
+        if feat_early.shape[1] != self.c_out:
+            feat_mean = feat_early.mean(dim=1, keepdim=True).expand(-1, self.c_out, -1, -1)
+            feat_aligned = feat_mean
+            
+        # 4. 计算差异图 (对应 reconstruction.py 的 get_difference_map 逻辑)
+        diff_map = torch.abs(recon_out - feat_aligned)
         return diff_map
+# ─────────────────────────────────────────────────────────────
+# 模块2：FeatureEnhance（替换为 feature_enhancement.py 实现）
+# ─────────────────────────────────────────────────────────────
+class Filtration(nn.Module):
+    """
+    差异图过滤模块 (公式5)
+    用于滤除背景噪声，增强目标-背景差异
+    """
+    def __init__(self, threshold: float = 0.5):
+        super().__init__()
+        self.threshold = nn.Parameter(torch.tensor(threshold), requires_grad=True)
+
+    def forward(self, I_d: torch.Tensor, target_size: Tuple[int, int]) -> torch.Tensor:
+        sign_output = torch.sign(I_d - self.threshold)
+        filtered = (sign_output + 1) * 0.5 + 1
+        I_D = F.interpolate(filtered, size=target_size, mode='bilinear', align_corners=False)
+        return I_D
 
 
-# ─────────────────────────────────────────────────────────────
-# 模块2：FeatureEnhance
-# ─────────────────────────────────────────────────────────────
 class FeatureEnhance(nn.Module):
     """
-    特征增强模块。
+    基于目标-背景差异的特征增强模块
+    对应论文中的 Fig.3 结构
 
-    将 feat_early 与 diff_map concat 后，通过卷积融合并压回原通道数，
-    再以残差方式叠加原 feat_early，保留原始特征信息。
-
-    Args:
-        c1 (int): feat_early 的通道数（通常为 128）
-        c_diff (int): diff_map 的通道数（通常为 1）
+    输入:
+        [feat_early (B, C, H, W), diff_map (B, 1, H_orig, W_orig)]
+    输出:
+        enhanced (B, C, H, W)
     """
 
-    def __init__(self, c1: int, c_diff: int = 1):
+    def __init__(self, c1: int, groups: int = 4, reduction_ratio: int = 2):
         super().__init__()
-        c_in = c1 + c_diff  # concat 后通道数
 
-        # 融合卷积：将 concat 特征压回 c1 通道
-        self.fuse = nn.Sequential(
-            CBS(c_in, c1, k=1, s=1),   # 1x1 通道对齐
-            CBS(c1,   c1, k=3, s=1),   # 3x3 空间融合
+        self.in_channels = c1
+        self.groups = groups
+        self.reduction_ratio = reduction_ratio
+        self.mid_channels = c1 // reduction_ratio
+
+        # 分支一：特征图处理
+        self.group_conv = nn.Conv2d(
+            c1, c1,
+            kernel_size=1,
+            groups=groups,
+            bias=False
         )
 
-        # 可学习残差权重（初始化为 0，让模块从 identity 开始学习）
-        self.alpha = nn.Parameter(torch.zeros(1))
+        self.channel_interaction = nn.Sequential(
+            nn.Conv2d(c1, self.mid_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.mid_channels),
+            nn.Sigmoid()
+        )
+
+        self.height_attention = nn.Sequential(
+            nn.Conv2d(self.mid_channels, c1, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+        self.width_attention = nn.Sequential(
+            nn.Conv2d(self.mid_channels, c1, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+        # 分支二：差异图过滤
+        self.filtration = Filtration(threshold=0.5)
 
     def forward(self, inputs: list) -> torch.Tensor:
-        """
-        Args:
-            inputs: [feat_early (B, C, H, W), diff_map (B, 1, H, W)]
-        Returns:
-            enhanced: (B, C, H, W)
-        """
         feat_early, diff_map = inputs[0], inputs[1]
+        _, _, H, W = feat_early.shape
 
-        # Concat + 融合卷积
-        x = torch.cat([feat_early, diff_map], dim=1)   # (B, C+1, H, W)
-        x = self.fuse(x)                                # (B, C, H, W)
+        # 分支一：生成注意力权重
+        x_grouped = self.group_conv(feat_early)
 
-        # 残差：增强幅度由 alpha 控制（初始为 0，逐渐学习）
-        enhanced = feat_early + self.alpha * x
+        x_h = F.adaptive_avg_pool2d(x_grouped, (H, 1))
+        x_w = F.adaptive_avg_pool2d(x_grouped, (1, W))
 
-        return enhanced
+        x_w = x_w.permute(0, 1, 3, 2)
+        pooled = torch.cat([x_h, x_w], dim=2)
+
+        interacted = self.channel_interaction(pooled)
+
+        h_feat, w_feat = torch.split(interacted, [H, W], dim=2)
+        w_feat = w_feat.permute(0, 1, 3, 2)
+
+        attention_h = self.height_attention(h_feat)
+        attention_w = self.width_attention(w_feat)
+
+        # 分支二：差异图过滤（保持与 feature_enhancement.py 一致，当前不参与输出）
+        filtered_diff_map = self.filtration(diff_map, target_size=(H, W))
+        # ✅ 核心修复：兼容 1ch/3ch 差异图，统一转为 (B, 1, H, W) 空间权重
+        if filtered_diff_map.shape[1] > 1:
+            diff_weight = filtered_diff_map.mean(dim=1, keepdim=True)
+        else:
+            diff_weight = filtered_diff_map
+
+        weighted_feature = feat_early * attention_h * attention_w
+        output = weighted_feature * feat_early * diff_weight
+
+
+        return output
 
 
 # ─────────────────────────────────────────────────────────────
