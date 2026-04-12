@@ -5,3 +5,5 @@ sat_results/
 runs/
 coco128/
 recon_checkpoints/
+reconstruction-enhance-detection/
+track_results_vis/
