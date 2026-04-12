@@ -9,7 +9,12 @@ OUT_LABELS_TRAIN = OUT_ROOT / "labels" / "train"
 OUT_LABELS_VAL   = OUT_ROOT / "labels" / "val"
 OUT_IMAGES_TRAIN = OUT_ROOT / "images" / "train"
 OUT_IMAGES_VAL   = OUT_ROOT / "images" / "val"
-CLASS_MAP = {"car": 0}
+CLASS_MAP = {
+    "car": 0,
+    "airplane": 1,
+    "ship": 2,
+    "train": 3,
+}
 
 
 def parse_xml(xml_path):
@@ -45,6 +50,10 @@ def convert_split(data_dir, out_labels_dir, out_images_dir, split_name):
     for seq in sequences:
         img_dir = seq / "img1"
         xml_dir = seq / "xml"
+        if not img_dir.exists():
+            img_dir = seq
+        if not xml_dir.exists() and (data_dir.parent / seq.name / "xml").exists():
+            xml_dir = data_dir.parent / seq.name / "xml"
         if not img_dir.exists() or not xml_dir.exists():
             continue
         images = sorted(img_dir.glob("*.jpg")) + sorted(img_dir.glob("*.png"))
@@ -72,13 +81,16 @@ def convert_split(data_dir, out_labels_dir, out_images_dir, split_name):
 def write_yaml():
     yaml_path = Path("/data/lz/pythonProjects/HP-tracker/yolov8/satvideodt.yaml")
     yaml_path.write_text(
-        "# SatVideoDT dataset - satellite video car detection\n"
+        "# SatVideoDT dataset - satellite video object detection\n"
         f"path: {OUT_ROOT}\n"
         "train: images/train\n"
         "val:   images/val\n"
-        "\nnc: 1\n"
+        "\nnc: 4\n"
         "\nnames:\n"
-        "  0: car\n",
+        "  0: car\n"
+        "  1: airplane\n"
+        "  2: ship\n"
+        "  3: train\n",
         encoding="utf-8",
     )
     print(f"  YAML written: {yaml_path}")
@@ -95,4 +107,4 @@ if __name__ == "__main__":
     yaml_path = write_yaml()
     print("\nDone!")
     print(f"  Set CFG['data_yaml'] = '{yaml_path}' in train.py")
-    print("  Set CFG['nc'] = 1 in train.py")
+    print("  Set CFG['nc'] = 4 in train.py")

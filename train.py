@@ -260,7 +260,7 @@ CFG = {
     "recon_weights": "/data/lz/pythonProjects/HP-tracker/yolov8/recon_checkpoints/recon_epoch_0038.pth", 
     "model_yaml":    "/data/lz/pythonProjects/HP-tracker/yolov8/yolov8n_custom.yaml",
     "model_weights": "/data/lz/pythonProjects/HP-tracker/yolov8/yolov8n.pt",
-    "nc":            1,
+    "nc":            4,
     # 训练
     "epochs":        50,
     "lr0":           1e-3,
@@ -268,7 +268,7 @@ CFG = {
     "weight_decay":  5e-4,
     "warmup_epochs": 3,
     # 保存 & 日志
-    "save_dir":      "/data/lz/pythonProjects/HP-tracker/yolov8/yolo-enhance-results",
+    "save_dir":      "/data/lz/pythonProjects/HP-tracker/yolov8/reconstruction-enhance-detection",
     "save_period":   5,
     # 断点续训：填写 checkpoint 路径可续训，留空则从头训练
     "resume":        "",
@@ -509,7 +509,7 @@ def train(rank=-1, world_size=1):
         LOGGER.info(f"[TensorBoard] tensorboard --logdir {save_dir / 'tensorboard'}")
 
     # ── 构建自定义模型 ────────────────────────────────────────────────
-    # 直接从 YAML 构建 DetectionModel，nc 在此指定为 1
+    # 直接从 YAML 构建 DetectionModel，nc 在此指定为 4
     model = DetectionModel(cfg["model_yaml"], ch=3, nc=cfg["nc"], verbose=main)
 
     # ── 迁移预训练权重（backbone/neck 层按结构顺序对齐迁移）────────────
@@ -524,9 +524,15 @@ def train(rank=-1, world_size=1):
 
     model = model.to(device)
 
-    # 确保所有参数可训练
-    for p in model.parameters():
-        p.requires_grad_(True)
+    # 冻结 BackgroundReconstruct 参数，不参与反向传播更新
+    background_reconstruct = model.model[2]
+    for p in background_reconstruct.parameters():
+        p.requires_grad_(False)
+
+    # 其余参数保持可训练
+    for name, p in model.named_parameters():
+        if not name.startswith("model.2."):
+            p.requires_grad_(True)
 
     # 确保 model.args 是带属性访问的 IterableSimpleNamespace
     from ultralytics.utils import IterableSimpleNamespace

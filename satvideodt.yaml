@@ -1,9 +1,12 @@
-# SatVideoDT dataset - satellite video car detection
+# SatVideoDT dataset - satellite video object detection
 path: /data/lz/SatVideoDT/yolo_dataset
 train: images/train
 val:   images/val
 
-nc: 1
+nc: 4
 
 names:
   0: car
+  1: airplane
+  2: ship
+  3: train
