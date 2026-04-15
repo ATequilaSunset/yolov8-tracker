@@ -3,41 +3,16 @@
 #
 #   原 backbone layer 1（CBS P2/4）输出的 feat_early 被缓存，
 #   在原 C2f[128] 之前插入两个新层：
-#     layer 2 : BackgroundReconstruct(feat_early)             -> diff_map  (1ch)
-#     layer 3 : FeatureEnhance([feat_early, diff_map])        -> enhanced  (128ch)
+#     layer 2 : BackgroundReconstruct(时机占位，实际使用 raw_input) -> diff_map (1ch)
+#     layer 3 : FeatureEnhance([feat_early, diff_map])              -> enhanced (128ch)
 #   原 C2f[128] 从 layer 3 的 enhanced 开始，后续结构完全不变，
 #   仅所有层序号整体 +2，head 中的 from 索引相应更新。
 #
-# 层序号对照表（原 -> 新）：
-#   0 Conv P1/2        0 (不变)
-#   1 Conv P2/4        1 (不变, feat_early，被后续引用需缓存)
-#   --- 新增 ---        2 BackgroundReconstruct  from=1
-#   --- 新增 ---        3 FeatureEnhance         from=[1,2]
-#   2 C2f[128]         4 (from=-1, 即3)
-#   3 Conv P3/8        5
-#   4 C2f[256]         6  ← head Concat 引用，原 from=4 -> 6
-#   5 Conv P4/16       7
-#   6 C2f[512]         8  ← head Concat 引用，原 from=6 -> 8
-#   7 Conv P5/32       9
-#   8 C2f[1024]       10
-#   9 SPPF[1024]      11  ← head Concat 引用，原 from=9 -> 11
-#
 # parse_model 说明：
-#   BackgroundReconstruct 不在 base_modules 中，args 直接透传，
-#   输出通道由 else: c2=ch[f] 推导（取 from 层通道数=128），
-#   但实际输出是 1ch，需在 args 中显式指定 c_out=1 以让 parse_model
-#   正确记录后续层的输入通道数。为此，我们在 BackgroundReconstruct
-#   和 FeatureEnhance 的 __init__ 第一个位置参数设为 c1，
-#   parse_model 对非 base_module 会走 else 分支：c2=ch[f]，
-#   这不够用——需要额外处理（见下方注释及 train.py 中的注册逻辑）。
-#
-# ★ 解决方案：在 args 中传入输出通道数，并在模块 __init__ 中接收，
-#   同时在注册时将模块加入 parse_model 的通道推导逻辑。
-#   实际上最简单的方式是：让 BackgroundReconstruct.__init__(c1, c_out)
-#   并在 YAML args 中写明 c_out，parse_model 的 else 分支
-#   执行 c2=ch[f]，所以 BackgroundReconstruct 的输出通道
-#   必须通过 parse_model patch 来告知。
-#   见 train.py 中 patch_parse_model() 函数。
+#   BackgroundReconstruct 在图结构中的 from=1 仅表示插入位置与执行时机，
+#   实际 forward 时读取的是共享上下文中的原始输入图像 raw_input，
+#   输出固定为 1 通道 diff_map。对应的输出通道推导在 train.py 的
+#   patch_parse_model() 中显式处理。
 
 nc: 80  # 类别数（train.py 会在构建后替换为 4）
 scales:
@@ -49,16 +24,16 @@ backbone:
   # idx  [from,  n,  module,                args]
   - [-1,  1, Conv,                    [64,  3, 2]]  # 0  P1/2  (H/2)
   - [-1,  1, Conv,                    [128, 3, 2]]  # 1  P2/4  (H/4) feat_early
-  - [ 1,  1, BackgroundReconstruct,   [128, 3]]         # 2  diff_map (3ch)
-  - [[1, 2], 1, FeatureEnhance,       [128, 4, 2]]   # 3  enhanced (128ch)
-  - [-1,  3, C2f,                     [128, True]]   # 4
-  - [-1,  1, Conv,                    [256, 3, 2]]   # 5  P3/8
-  - [-1,  6, C2f,                     [256, True]]   # 6
-  - [-1,  1, Conv,                    [512, 3, 2]]   # 7  P4/16
-  - [-1,  6, C2f,                     [512, True]]   # 8
-  - [-1,  1, Conv,                    [1024, 3, 2]]  # 9  P5/32
-  - [-1,  3, C2f,                     [1024, True]]  # 10
-  - [-1,  1, SPPF,                    [1024, 5]]     # 11
+  - [ 1,  1, BackgroundReconstruct,   []]           # 2  diff_map (1ch, 实际使用 raw_input)
+  - [[1, 2], 1, FeatureEnhance,       [128, 4, 2]] # 3  enhanced (128ch)
+  - [-1,  3, C2f,                     [128, True]] # 4
+  - [-1,  1, Conv,                    [256, 3, 2]] # 5  P3/8
+  - [-1,  6, C2f,                     [256, True]] # 6
+  - [-1,  1, Conv,                    [512, 3, 2]] # 7  P4/16
+  - [-1,  6, C2f,                     [512, True]] # 8
+  - [-1,  1, Conv,                    [1024, 3, 2]]# 9  P5/32
+  - [-1,  3, C2f,                     [1024, True]]# 10
+  - [-1,  1, SPPF,                    [1024, 5]]   # 11
 
 # ── Head ──────────────────────────────────────────────────────────────
 # 与原版结构完全一致，仅 from 索引 +2

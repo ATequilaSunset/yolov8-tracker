@@ -35,7 +35,7 @@ def patch_parse_model():
     Monkey-patch ultralytics.nn.tasks.parse_model，在 else 分支前
     插入对 BackgroundReconstruct 和 FeatureEnhance 的通道处理逻辑：
 
-      BackgroundReconstruct(c1)                     -> 输出 1ch  (diff_map)
+      BackgroundReconstruct(c1, ...)                  -> 输出 1ch (diff_map)
       FeatureEnhance(c1, groups=4, reduction_ratio=2) -> 输出 c1 ch (与 feat_early 相同)
 
     parse_model 的 else 分支默认 c2 = ch[f]，对多输入层取最后一个 from
@@ -102,11 +102,10 @@ def patch_parse_model():
         #   new_args  : 传给模块 __init__ 的最终 args
         # train.py -> patch_parse_model() 内部
         def _bgr_channels(args, ch_in_list):
+            # BackgroundReconstruct 真实计算依赖 raw_input，图上的输入仅用于占位/时机控制。
             c1 = ch_in_list[0]
-            c_mid = args[0] if len(args) > 0 else None
-            c_out = args[1] if len(args) > 1 else 3  # 默认 3 通道（与你的权重一致）
-            new_args = [c1, c_mid, c_out]
-            return c_out, new_args  # ✅ 必须返回 c_out，不能写死 1
+            new_args = [c1, *args]
+            return 1, new_args
 
         def _feh_channels(args, ch_in_list):
             # FeatureEnhance(c1, groups=4, reduction_ratio=2)
@@ -205,6 +204,8 @@ def patch_parse_model():
             elif m in custom_channel_handlers:
                 ch_in_list = [ch[x] for x in f] if isinstance(f, list) else [ch[f]]
                 c2, args = custom_channel_handlers[m](args, ch_in_list)
+                if m is BackgroundReconstruct:
+                    print(f"[parse_model] build BackgroundReconstruct with args={args}, ch_in={ch_in_list}, c2={c2}")
             # ────────────────────────────────────────────────────────
             else:
                 c2 = ch[f]
@@ -245,8 +246,10 @@ from ultralytics.utils.loss import v8DetectionLoss
 
 
 def de_parallel(model):
-    """返回单卡模型（去掉 DDP/DataParallel 包装）。"""
-    return model.module if isinstance(model, (DDP, torch.nn.DataParallel)) else model
+    """返回单卡模型（去掉 DDP/DataParallel/上下文包装）。"""
+    while isinstance(model, (DDP, torch.nn.DataParallel, RawInputContextModel)):
+        model = model.module if isinstance(model, (DDP, torch.nn.DataParallel)) else model.model
+    return model
 
 
 # ─────────────────────────── 超参数配置 ───────────────────────────
@@ -461,38 +464,70 @@ def load_pretrained_weights(model, weights_path, device):
 
 
 def load_recon_pretrained(model, recon_ckpt_path, device):
-    """将独立的 BackgroundReconstruct 权重精准注入 YOLO 的 layer 2"""
+    """将 recon_epoch 权重加载到 YOLO 中的 BackgroundReconstruct.recon_net。"""
     if not recon_ckpt_path or not os.path.exists(recon_ckpt_path):
-        LOGGER.info("⚠️  未指定或找不到重建模块权重，跳过加载")
+        LOGGER.info("⚠️  未指定或找不到重建分支权重，跳过加载")
         return model
+
+    base_model = de_parallel(model)
+    background_reconstruct = base_model.model[2]
+    if not isinstance(background_reconstruct, BackgroundReconstruct):
+        raise TypeError("model.model[2] 不是 BackgroundReconstruct，无法加载重建分支权重")
 
     ckpt = torch.load(recon_ckpt_path, map_location=device)
-    # 兼容 torch.save(state_dict) 或 torch.save({'model': state_dict})
     recon_sd = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
-
-    # 1. 清理 DataParallel 遗留的 module. 前缀
     cleaned_sd = {k.replace("module.", ""): v for k, v in recon_sd.items()}
 
-    # 2. 拼接 YOLO 模型中的正确前缀 (单卡: model.2. | DDP: module.model.2.)
-    is_ddp = isinstance(model, DDP)
-    prefix = "module.model.2." if is_ddp else "model.2."
-    mapped_sd = {prefix + k: v for k, v in cleaned_sd.items()}
-
-    # 3. 通道形状预检（防止 1ch/3ch 不一致导致崩溃）
-    current_sd = model.state_dict()
-    shape_mismatch = []
-    for k, v in mapped_sd.items():
-        if k in current_sd and current_sd[k].shape != v.shape:
-            shape_mismatch.append(f"  {k} -> 模型{current_sd[k].shape} vs 权重{v.shape}")
-    if shape_mismatch:
-        LOGGER.error("❌ 权重通道形状不匹配，已中止加载：\n" + "\n".join(shape_mismatch))
-        LOGGER.error("请确保 YAML 中 BackgroundReconstruct 的 c_out 与预训练权重一致！")
-        return model
-
-    # 4. 注入权重
-    model.load_state_dict(mapped_sd, strict=False)
-    LOGGER.info(f"✅ 成功加载 BackgroundReconstruct 权重至 layer 2: {recon_ckpt_path}")
+    missing, unexpected = background_reconstruct.recon_net.load_state_dict(cleaned_sd, strict=False)
+    LOGGER.info(
+        f"✅ 成功加载 SelfReconstructionNetwork 权重至 BackgroundReconstruct: {recon_ckpt_path}"
+        f" | missing={len(missing)} | unexpected={len(unexpected)}"
+    )
     return model
+
+
+def freeze_recon_branch(model):
+    """冻结 BackgroundReconstruct 内部的完整重建分支，并保持其 eval 模式。"""
+    base_model = de_parallel(model)
+    background_reconstruct = base_model.model[2]
+    if not isinstance(background_reconstruct, BackgroundReconstruct):
+        raise TypeError("model.model[2] 不是 BackgroundReconstruct，无法冻结重建分支")
+
+    background_reconstruct.recon_net.eval()
+    for p in background_reconstruct.recon_net.parameters():
+        p.requires_grad_(False)
+
+    LOGGER.info("✅ 已冻结 BackgroundReconstruct.recon_net（ResNet50 + RM）")
+    return model
+
+
+class RawInputContextModel(torch.nn.Module):
+    """为 DetectionModel 注入 raw_input 上下文，供 BackgroundReconstruct 在 forward 中读取。"""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x, *args, **kwargs):
+        set_background_reconstruct_raw_input(self, x)
+        try:
+            return self.model(x, *args, **kwargs)
+        finally:
+            clear_background_reconstruct_raw_input(self)
+
+
+def set_background_reconstruct_raw_input(model, raw_input):
+    """在一次 forward 前，将原图写入所有 BackgroundReconstruct 模块的上下文。"""
+    for module in de_parallel(model).modules():
+        if isinstance(module, BackgroundReconstruct):
+            module.set_raw_input(raw_input)
+
+
+def clear_background_reconstruct_raw_input(model):
+    """在一次 forward 后清理 BackgroundReconstruct 的原图上下文。"""
+    for module in de_parallel(model).modules():
+        if isinstance(module, BackgroundReconstruct):
+            module.clear_raw_input()
 
 # ─────────────────────────── 主训练函数 ───────────────────────────
 def train(rank=-1, world_size=1):
@@ -515,24 +550,17 @@ def train(rank=-1, world_size=1):
     # ── 迁移预训练权重（backbone/neck 层按结构顺序对齐迁移）────────────
     model = load_pretrained_weights(model, cfg["model_weights"], device="cpu")
 
-    # ✅ 新增：加载 BackgroundReconstruct 独立预训练权重
+    # ✅ 新增：加载并冻结完整重建分支（SelfReconstructionNetwork）
     model = load_recon_pretrained(model, cfg.get("recon_weights"), device=device)
-
-    if main:
-        recon_layer = de_parallel(model).model[2]
-        LOGGER.info(f"[验证] BackgroundReconstruct 输出通道: {recon_layer.c_out}")
+    model = freeze_recon_branch(model)
 
     model = model.to(device)
 
-    # 冻结 BackgroundReconstruct 参数，不参与反向传播更新
-    background_reconstruct = model.model[2]
-    for p in background_reconstruct.parameters():
-        p.requires_grad_(False)
+    if main:
+        recon_layer = de_parallel(model).model[2]
+        LOGGER.info(f"[验证] BackgroundReconstruct 输出通道: {recon_layer.out_channels}")
 
     # 其余参数保持可训练
-    for name, p in model.named_parameters():
-        if not name.startswith("model.2."):
-            p.requires_grad_(True)
 
     # 确保 model.args 是带属性访问的 IterableSimpleNamespace
     from ultralytics.utils import IterableSimpleNamespace
@@ -583,6 +611,8 @@ def train(rank=-1, world_size=1):
     # ── DDP 包装 ───────────────────────────────────────────────────────
     if ddp:
         model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+
+    model = RawInputContextModel(model)
 
     # ── 损失函数 ───────────────────────────────────────────────────────
     compute_loss = TupleCompatibleDetectionLoss(model, de_parallel)

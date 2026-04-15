@@ -20,6 +20,7 @@ from ultralytics import YOLO
 
 from custom_modules import register_custom_modules
 from sort import Sort, TrackingVisualizer
+from train import RawInputContextModel
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -57,7 +58,10 @@ def load_model_compatible(weights_path: Path, model_yaml: Path, nc: int) -> YOLO
     2) 自定义 checkpoint（dict 且 ckpt['model'] 为 state_dict）
     """
     try:
-        return YOLO(str(weights_path))
+        yolo = YOLO(str(weights_path))
+        if not isinstance(yolo.model, RawInputContextModel):
+            yolo.model = RawInputContextModel(yolo.model)
+        return yolo
     except AttributeError as e:
         if "OrderedDict" not in str(e):
             raise
@@ -65,7 +69,7 @@ def load_model_compatible(weights_path: Path, model_yaml: Path, nc: int) -> YOLO
         from ultralytics.nn.tasks import DetectionModel
 
         yolo = YOLO(str(model_yaml))
-        yolo.model = DetectionModel(str(model_yaml), ch=3, nc=nc, verbose=False)
+        base_model = DetectionModel(str(model_yaml), ch=3, nc=nc, verbose=False)
 
         ckpt = torch.load(str(weights_path), map_location="cpu", weights_only=False)
 
@@ -76,7 +80,8 @@ def load_model_compatible(weights_path: Path, model_yaml: Path, nc: int) -> YOLO
         else:
             raise RuntimeError("不支持的 checkpoint 格式，无法解析为 state_dict")
 
-        yolo.model.load_state_dict(state_dict, strict=True)
+        base_model.load_state_dict(state_dict, strict=True)
+        yolo.model = RawInputContextModel(base_model)
         return yolo
 
 
